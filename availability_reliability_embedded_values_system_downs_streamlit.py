@@ -32,6 +32,35 @@ H4sIAP1OF2oC/6y9W64mR3Im+N6ryAUUD9zM73xLkKkWARZZk2QVuudNgAR0P4wESNUDzBL6uZekjY3b
 """
 
 
+
+PONDERATE_KIT_CSV = r"""System,Ponderate weight Kit
+SEIS-SERVICIOS E INSPECCIONES,0%
+SES-SISTEMA ESTRUCTURAL,18%
+SPO-SISTEMA DE POTENCIA,10%
+SAC-SISTEMA DE ACCESORIOS,2%
+LLAN-SISTEMA DE LLANTAS,0
+ND,0
+SPR-SISTEMA DE PROPULSION MECANICA,"1,5%"
+SPC-SISTEMA DE PROTECCION Y CONTROL CENTRAL,1%
+SPRE-SISTEMA DE PROPULSIÓN ELÉCTRICA,12%
+ARC-SISTEMA DE ARRANQUE Y CARGA,1%
+SAUX-SISTEMA AUXILIAR ENFRIAMIENTO SIEMENS,28%
+-TEMPORY CODE,0
+SDIR-SISTEMA DE DIRECCIÓN,15%
+OPER-EVENTOS OPERACIONALES,0
+SHI-SISTEMA HIDRAULICO,10%
+SGEN-SISTEMA DE GENERACION,8%
+SLEV-SISTEMA DE LEVANTE,1%
+SFR-SISTEMA DE FRENOS,1%
+LUCE-SISTEMA DE LUCES,0%
+SCO-SISTEMA DE CONTROL,8%
+SLUC-SISTEMA CENTRALIZADO DE GRASA,0%
+PROT-SISTEMA DE PROTECCIONES,0%
+SEL-SISTEMA ELÉCTRICO,1%
+EL24-SISTEMA ELÉCTRICO DE 24 / 12 VOLTIOS,0%
+SAD-SISTEMA DE ADITAMENTOS,8%
+"""
+
 def pct(x):
     return "-" if pd.isna(x) else f"{x:.1%}"
 
@@ -72,6 +101,73 @@ def load_historical_system_downs() -> pd.DataFrame:
     return df[df["DT"].between(MIN_TRUCK, MAX_TRUCK) & df["Period"].between(START_PERIOD, END_PERIOD)].copy()
 
 
+
+@st.cache_data(show_spinner=False)
+def load_ponderate_kit_data() -> pd.DataFrame:
+    kit_df = pd.read_csv(StringIO(PONDERATE_KIT_CSV))
+    kit_df["System"] = kit_df["System"].astype(str).str.strip()
+
+    def parse_weight(value):
+        if pd.isna(value):
+            return 0.0
+        text = str(value).strip().replace("%", "").replace(",", ".")
+        if text == "":
+            return 0.0
+        try:
+            number = float(text)
+        except ValueError:
+            return 0.0
+        # Values in the source are percentages: 18 means 18%.
+        return number / 100 if number > 1 else number
+
+    kit_df["Kit improvement factor"] = kit_df["Ponderate weight Kit"].apply(parse_weight)
+    kit_df["Kit improvement factor"] = kit_df["Kit improvement factor"].clip(lower=0, upper=1)
+    return kit_df[["System", "Ponderate weight Kit", "Kit improvement factor"]]
+
+
+def build_kit_adjusted_data(values_df: pd.DataFrame, historical_df: pd.DataFrame, kit_df: pd.DataFrame, apply_improvement: bool):
+    hist = historical_df.merge(kit_df, on="System", how="left")
+    hist["Kit improvement factor"] = hist["Kit improvement factor"].fillna(0.0)
+    hist["Ponderate weight Kit"] = hist["Ponderate weight Kit"].fillna("0%")
+    hist["Base event duration hours"] = hist["Event duration hours"]
+    hist["Kit adjusted event duration hours"] = hist["Base event duration hours"] * (1 - hist["Kit improvement factor"])
+    hist["Kit reduced down hours"] = hist["Base event duration hours"] - hist["Kit adjusted event duration hours"]
+
+    monthly_reduction = (
+        hist.groupby(["DT", "Period"], dropna=False)
+        .agg(
+            Historical_base_down_hours=("Base event duration hours", "sum"),
+            Historical_adjusted_down_hours=("Kit adjusted event duration hours", "sum"),
+            Kit_reduced_down_hours=("Kit reduced down hours", "sum"),
+        )
+        .reset_index()
+    )
+
+    values = values_df.merge(monthly_reduction, on=["DT", "Period"], how="left")
+    for col in ["Historical_base_down_hours", "Historical_adjusted_down_hours", "Kit_reduced_down_hours"]:
+        values[col] = values[col].fillna(0.0)
+
+    values["Base Hours down (EVs)"] = values["Hours down (EVs)"]
+    values["Kit adjusted Hours down (EVs)"] = (values["Base Hours down (EVs)"] - values["Kit_reduced_down_hours"]).clip(lower=0)
+
+    if apply_improvement:
+        values["Hours down (EVs)"] = values["Kit adjusted Hours down (EVs)"]
+
+    values["Base Availability"] = np.where(
+        values["hours scheduled"] > 0,
+        1 - values["Base Hours down (EVs)"] / values["hours scheduled"],
+        np.nan,
+    )
+    values["Kit adjusted Availability"] = np.where(
+        values["hours scheduled"] > 0,
+        1 - values["Kit adjusted Hours down (EVs)"] / values["hours scheduled"],
+        np.nan,
+    )
+    values["Availability improvement points"] = values["Kit adjusted Availability"] - values["Base Availability"]
+
+    return values, hist
+
+
 def fleet_monthly(values: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for period, grp in values.groupby("Period"):
@@ -101,6 +197,7 @@ def truck_summary(values: pd.DataFrame, mission_hours: float) -> pd.DataFrame:
 
 values_df = load_values_data()
 historical_df = load_historical_system_downs()
+kit_df = load_ponderate_kit_data()
 
 st.title("Truck Availability, Reliability & System Down Analysis")
 st.caption("Embedded data only | Values sheet + Historical columns A, E, F, H, Y | Trucks 823–852 | Jan 2024–Mar 2025")
@@ -117,20 +214,34 @@ with st.sidebar:
     top_n_systems = st.slider("Top systems to show", 5, 25, 10, 1)
     system_options = sorted(historical_df["System"].dropna().unique().tolist())
     selected_systems = st.multiselect("Systems", system_options, default=system_options)
+    kits_reactivation_improvement = st.toggle("Kits Reactivation improment", value=False, help="Apply the Ponderate weight Kit factor to reduce down hours by system and simulate the availability improvement.")
 
 start_sel = pd.Timestamp(selected_range[0]).replace(day=1)
 end_sel = pd.Timestamp(selected_range[1]) + pd.offsets.MonthEnd(0)
-filtered_values = values_df[values_df["DT"].isin(selected_trucks) & values_df["Period"].between(start_sel, end_sel)].copy()
-filtered_hist = historical_df[historical_df["DT"].isin(selected_trucks) & historical_df["Period"].between(start_sel, end_sel) & historical_df["System"].isin(selected_systems)].copy()
+base_filtered_values = values_df[values_df["DT"].isin(selected_trucks) & values_df["Period"].between(start_sel, end_sel)].copy()
+base_filtered_hist = historical_df[historical_df["DT"].isin(selected_trucks) & historical_df["Period"].between(start_sel, end_sel) & historical_df["System"].isin(selected_systems)].copy()
+
+filtered_values, filtered_hist = build_kit_adjusted_data(
+    base_filtered_values,
+    base_filtered_hist,
+    kit_df,
+    kits_reactivation_improvement,
+)
 
 fleet = fleet_monthly(filtered_values)
 trucks = truck_summary(filtered_values, mission_hours)
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Fleet availability", pct(1 - filtered_values["Hours down (EVs)"].sum() / filtered_values["hours scheduled"].sum()))
+base_fleet_availability = 1 - filtered_values["Base Hours down (EVs)"].sum() / filtered_values["hours scheduled"].sum()
+kit_fleet_availability = 1 - filtered_values["Kit adjusted Hours down (EVs)"].sum() / filtered_values["hours scheduled"].sum()
+active_fleet_availability = 1 - filtered_values["Hours down (EVs)"].sum() / filtered_values["hours scheduled"].sum()
+kit_down_reduction = filtered_hist["Kit reduced down hours"].sum() if not filtered_hist.empty else 0.0
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Fleet availability", pct(active_fleet_availability), delta=pct(kit_fleet_availability - base_fleet_availability) if kits_reactivation_improvement else None)
 k2.metric("Fleet MTBF", f"{num(fleet['MTBF'].mean())} h")
 k3.metric("System-down events", f"{len(filtered_hist):,}")
-k4.metric("System-down duration", f"{num(filtered_hist['Event duration hours'].sum())} h")
+k4.metric("Base system-down duration", f"{num(filtered_hist['Base event duration hours'].sum())} h")
+k5.metric("Kit down reduction", f"{num(kit_down_reduction)} h")
 
 tab1, tab2, tab3, tab4 = st.tabs(["Fleet trend", "Truck ranking", "Down by system", "Embedded data quality"])
 
@@ -145,7 +256,7 @@ with tab1:
 
 with tab2:
     st.subheader("Truck ranking")
-    fig_rank = px.bar(trucks.sort_values("Availability"), x="DT", y="Availability", text="Availability", hover_data=["Reliability", "MTBF", "Hours down", "Events MTBF"])
+    fig_rank = px.bar(trucks.sort_values("Availability"), x="DT", y="Availability", text="Availability", hover_data=["Reliability", "MTBF", "Hours down", "Events MTBF", "Base Availability", "Kit adjusted Availability", "Availability improvement points"])
     fig_rank.update_traces(texttemplate="%{text:.1%}", textposition="outside")
     fig_rank.update_yaxes(tickformat=".0%")
     fig_rank.update_xaxes(type="category")
@@ -154,44 +265,147 @@ with tab2:
 
 with tab3:
     st.subheader("Analysis of down by system")
-    st.caption("This section is built only from Historical: column A Truck, column H System, column Y Event duration, column E Event start, and column F Event end.")
+    st.caption("This section is built from Historical and applies the Ponderate weight Kit by system when the sidebar option **Kits Reactivation improment** is enabled.")
     if filtered_hist.empty:
         st.warning("No historical system-down records for the selected filters.")
     else:
-        system_summary = (filtered_hist.groupby("System", dropna=False)
-            .agg(Events=("System", "size"), Duration_hours=("Event duration hours", "sum"), Avg_duration=("Event duration hours", "mean"), Trucks_affected=("DT", "nunique"), First_event=("Event start", "min"), Last_event=("Event end", "max"))
-            .reset_index().sort_values("Duration_hours", ascending=False))
+        system_summary = (
+            filtered_hist.groupby("System", dropna=False)
+            .agg(
+                Events=("System", "size"),
+                Duration_hours=("Base event duration hours", "sum"),
+                Kit_adjusted_duration_hours=("Kit adjusted event duration hours", "sum"),
+                Kit_reduced_down_hours=("Kit reduced down hours", "sum"),
+                Kit_improvement_factor=("Kit improvement factor", "max"),
+                Avg_duration=("Base event duration hours", "mean"),
+                Trucks_affected=("DT", "nunique"),
+                First_event=("Event start", "min"),
+                Last_event=("Event end", "max"),
+            )
+            .reset_index()
+            .sort_values("Duration_hours", ascending=False)
+        )
         total_duration = system_summary["Duration_hours"].sum()
+        total_adjusted_duration = system_summary["Kit_adjusted_duration_hours"].sum()
         system_summary["Duration share"] = np.where(total_duration > 0, system_summary["Duration_hours"] / total_duration, np.nan)
         system_summary["Pareto cumulative"] = system_summary["Duration share"].cumsum()
+        system_summary["Reduction share"] = np.where(system_summary["Duration_hours"] > 0, system_summary["Kit_reduced_down_hours"] / system_summary["Duration_hours"], 0)
         top_systems = system_summary.head(top_n_systems)
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Events", f"{len(filtered_hist):,}")
-        c2.metric("Total duration", f"{num(total_duration)} h")
-        c3.metric("Systems", f"{filtered_hist['System'].nunique():,}")
+        c2.metric("Base duration", f"{num(total_duration)} h")
+        c3.metric("Kit adjusted duration", f"{num(total_adjusted_duration)} h")
+        c4.metric("Down reduction", f"{num(total_duration - total_adjusted_duration)} h", delta=pct((total_duration - total_adjusted_duration) / total_duration) if total_duration > 0 else None)
 
-        fig_system = px.bar(top_systems, x="System", y="Duration_hours", text="Duration_hours", hover_data=["Events", "Avg_duration", "Trucks_affected", "Duration share", "First_event", "Last_event"], title="Top systems by event duration [hours]")
-        fig_system.update_traces(texttemplate="%{text:.1f}", textposition="outside")
-        fig_system.update_layout(xaxis_tickangle=-35, yaxis_title="Duration [h]")
+        fig_system = px.bar(
+            top_systems,
+            x="System",
+            y=["Duration_hours", "Kit_adjusted_duration_hours"],
+            barmode="group",
+            hover_data=["Events", "Avg_duration", "Trucks_affected", "Kit_improvement_factor", "Kit_reduced_down_hours", "First_event", "Last_event"],
+            title="Base vs kit-adjusted down duration by system [hours]",
+        )
+        fig_system.update_layout(xaxis_tickangle=-35, yaxis_title="Duration [h]", legend_title_text="")
         st.plotly_chart(fig_system, use_container_width=True)
 
-        monthly_system = (filtered_hist.groupby(["Period", "YearMonth", "System"], dropna=False)
-            .agg(Duration_hours=("Event duration hours", "sum"), Events=("System", "size"))
-            .reset_index())
+        monthly_system = (
+            filtered_hist.groupby(["Period", "YearMonth", "System"], dropna=False)
+            .agg(
+                Duration_hours=("Base event duration hours", "sum"),
+                Kit_adjusted_duration_hours=("Kit adjusted event duration hours", "sum"),
+                Kit_reduced_down_hours=("Kit reduced down hours", "sum"),
+                Events=("System", "size"),
+            )
+            .reset_index()
+        )
         monthly_top = monthly_system[monthly_system["System"].isin(top_systems["System"])]
-        fig_monthly = px.line(monthly_top, x="Period", y="Duration_hours", color="System", markers=True, hover_data=["YearMonth", "Events"], title="Monthly duration by system")
+        monthly_top["Displayed down hours"] = np.where(
+            kits_reactivation_improvement,
+            monthly_top["Kit_adjusted_duration_hours"],
+            monthly_top["Duration_hours"],
+        )
+        fig_monthly = px.line(monthly_top, x="Period", y="Displayed down hours", color="System", markers=True, hover_data=["YearMonth", "Events", "Duration_hours", "Kit_adjusted_duration_hours", "Kit_reduced_down_hours"], title="Monthly down duration by system")
         st.plotly_chart(fig_monthly, use_container_width=True)
 
-        truck_system = filtered_hist.pivot_table(index="DT", columns="System", values="Event duration hours", aggfunc="sum", fill_value=0)
+        truck_system = filtered_hist.pivot_table(
+            index="DT",
+            columns="System",
+            values="Kit adjusted event duration hours" if kits_reactivation_improvement else "Base event duration hours",
+            aggfunc="sum",
+            fill_value=0,
+        )
         truck_system = truck_system[[c for c in top_systems["System"] if c in truck_system.columns]]
         fig_heat = px.imshow(truck_system, aspect="auto", text_auto=".1f", labels=dict(x="System", y="Truck", color="Duration [h]"), title="Duration matrix by truck and system")
         st.plotly_chart(fig_heat, use_container_width=True)
 
+        truck_impact = (
+            filtered_values.groupby("DT", dropna=False)
+            .agg(
+                Base_hours_down=("Base Hours down (EVs)", "sum"),
+                Kit_adjusted_hours_down=("Kit adjusted Hours down (EVs)", "sum"),
+                Kit_reduced_down_hours=("Kit_reduced_down_hours", "sum"),
+                Scheduled_hours=("hours scheduled", "sum"),
+                Base_availability=("Base Availability", "mean"),
+                Kit_adjusted_availability=("Kit adjusted Availability", "mean"),
+            )
+            .reset_index()
+        )
+        truck_impact["Availability improvement points"] = truck_impact["Kit_adjusted_availability"] - truck_impact["Base_availability"]
+
+        st.markdown("**Truck availability impact from Kits Reactivation improment**")
+        fig_truck_impact = px.bar(
+            truck_impact.sort_values("Availability improvement points", ascending=False),
+            x="DT",
+            y="Availability improvement points",
+            text="Availability improvement points",
+            hover_data=["Base_hours_down", "Kit_adjusted_hours_down", "Kit_reduced_down_hours", "Base_availability", "Kit_adjusted_availability"],
+            title="Availability improvement by truck",
+        )
+        fig_truck_impact.update_traces(texttemplate="%{text:.2%}", textposition="outside")
+        fig_truck_impact.update_yaxes(tickformat=".1%")
+        fig_truck_impact.update_xaxes(type="category")
+        st.plotly_chart(fig_truck_impact, use_container_width=True)
+
         st.markdown("**System summary**")
-        st.dataframe(system_summary.style.format({"Duration_hours": "{:,.1f}", "Avg_duration": "{:,.1f}", "Duration share": "{:.1%}", "Pareto cumulative": "{:.1%}"}), use_container_width=True)
+        st.dataframe(
+            system_summary.style.format(
+                {
+                    "Duration_hours": "{:,.1f}",
+                    "Kit_adjusted_duration_hours": "{:,.1f}",
+                    "Kit_reduced_down_hours": "{:,.1f}",
+                    "Kit_improvement_factor": "{:.1%}",
+                    "Avg_duration": "{:,.1f}",
+                    "Duration share": "{:.1%}",
+                    "Pareto cumulative": "{:.1%}",
+                    "Reduction share": "{:.1%}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        st.markdown("**Truck impact summary**")
+        st.dataframe(
+            truck_impact.style.format(
+                {
+                    "Base_hours_down": "{:,.1f}",
+                    "Kit_adjusted_hours_down": "{:,.1f}",
+                    "Kit_reduced_down_hours": "{:,.1f}",
+                    "Base_availability": "{:.1%}",
+                    "Kit_adjusted_availability": "{:.1%}",
+                    "Availability improvement points": "{:.2%}",
+                }
+            ),
+            use_container_width=True,
+        )
+
         with st.expander("Embedded Historical event detail"):
-            st.dataframe(filtered_hist, use_container_width=True)
+            detail_cols = [
+                "DT", "System", "Event start", "Event end", "Base event duration hours",
+                "Ponderate weight Kit", "Kit adjusted event duration hours", "Kit reduced down hours"
+            ]
+            st.dataframe(filtered_hist[detail_cols], use_container_width=True)
+
 
 with tab4:
     st.subheader("Embedded data quality")
