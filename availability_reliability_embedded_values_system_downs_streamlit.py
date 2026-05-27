@@ -49,7 +49,12 @@ def load_values_data() -> pd.DataFrame:
     df["YearMonth"] = df["Period"].dt.to_period("M").astype(str)
     for col in df.columns:
         if col not in ["DT", "Period", "YearMonth"]:
-            df[col] = pd.to_numeric(df[col], errors="ignore")
+            
+            converted = pd.to_numeric(df[col], errors="coerce")
+            # Keep the converted numeric series only when conversion is meaningful.
+            # This avoids pandas/Streamlit Cloud errors from errors="ignore" in newer pandas versions.
+            if converted.notna().sum() > 0:
+                df[col] = converted
     return df[df["DT"].between(MIN_TRUCK, MAX_TRUCK) & df["Period"].between(START_PERIOD, END_PERIOD)].copy()
 
 
