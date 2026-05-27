@@ -187,12 +187,39 @@ def truck_summary(values: pd.DataFrame, mission_hours: float) -> pd.DataFrame:
         scheduled = grp["hours scheduled"].sum(min_count=1)
         operated = grp["hours operated"].sum(min_count=1)
         down = grp["Hours down (EVs)"].sum(min_count=1)
+        base_down = grp["Base Hours down (EVs)"].sum(min_count=1) if "Base Hours down (EVs)" in grp.columns else down
+        kit_down = grp["Kit adjusted Hours down (EVs)"].sum(min_count=1) if "Kit adjusted Hours down (EVs)" in grp.columns else down
+        kit_reduction = grp["Kit_reduced_down_hours"].sum(min_count=1) if "Kit_reduced_down_hours" in grp.columns else 0.0
         events = grp["Number of events (According MTBF)"].sum(min_count=1)
         mtbf = operated / events if pd.notna(events) and events > 0 else np.nan
         availability = 1 - down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
+        base_availability = 1 - base_down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
+        kit_adjusted_availability = 1 - kit_down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
+        improvement_points = kit_adjusted_availability - base_availability if pd.notna(base_availability) and pd.notna(kit_adjusted_availability) else np.nan
         reliability = np.exp(-mission_hours / mtbf) if pd.notna(mtbf) and mtbf > 0 else np.nan
-        rows.append({"DT": int(dt), "Availability": availability, "Reliability": reliability, "MTBF": mtbf, "Hours down": down, "Events MTBF": events, "Hours scheduled": scheduled})
-    return pd.DataFrame(rows).sort_values("Availability", ascending=False)
+        rows.append({
+            "DT": int(dt),
+            "Availability": availability,
+            "Reliability": reliability,
+            "MTBF": mtbf,
+            "Hours down": down,
+            "Base hours down": base_down,
+            "Kit adjusted hours down": kit_down,
+            "Kit reduced down hours": kit_reduction,
+            "Events MTBF": events,
+            "Hours scheduled": scheduled,
+            "Base Availability": base_availability,
+            "Kit adjusted Availability": kit_adjusted_availability,
+            "Availability improvement points": improvement_points,
+        })
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        return pd.DataFrame(columns=[
+            "DT", "Availability", "Reliability", "MTBF", "Hours down", "Base hours down",
+            "Kit adjusted hours down", "Kit reduced down hours", "Events MTBF", "Hours scheduled",
+            "Base Availability", "Kit adjusted Availability", "Availability improvement points"
+        ])
+    return summary.sort_values("Availability", ascending=False)
 
 
 values_df = load_values_data()
@@ -261,7 +288,21 @@ with tab2:
     fig_rank.update_yaxes(tickformat=".0%")
     fig_rank.update_xaxes(type="category")
     st.plotly_chart(fig_rank, use_container_width=True)
-    st.dataframe(trucks.style.format({"Availability": "{:.1%}", "Reliability": "{:.1%}", "MTBF": "{:,.1f}", "Hours down": "{:,.1f}"}), use_container_width=True)
+    st.dataframe(
+        trucks.style.format({
+            "Availability": "{:.1%}",
+            "Reliability": "{:.1%}",
+            "MTBF": "{:,.1f}",
+            "Hours down": "{:,.1f}",
+            "Base hours down": "{:,.1f}",
+            "Kit adjusted hours down": "{:,.1f}",
+            "Kit reduced down hours": "{:,.1f}",
+            "Base Availability": "{:.1%}",
+            "Kit adjusted Availability": "{:.1%}",
+            "Availability improvement points": "{:.2%}",
+        }),
+        use_container_width=True,
+    )
 
 with tab3:
     st.subheader("Analysis of down by system")
