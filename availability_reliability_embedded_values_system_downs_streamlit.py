@@ -292,6 +292,265 @@ def truck_summary(values: pd.DataFrame, mission_hours: float) -> pd.DataFrame:
     return summary.sort_values("Availability", ascending=False)
 
 
+def _safe_div(numerator: float, denominator: float, default: float = np.nan) -> float:
+    return numerator / denominator if denominator and pd.notna(denominator) and denominator != 0 else default
+
+
+def build_forecast_profiles(values: pd.DataFrame, hist: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
+    """Build bottom-up truck/system profiles from the selected historical period."""
+    avg_scheduled = values.groupby("DT")["hours scheduled"].mean()
+    if avg_scheduled.empty:
+        avg_scheduled = pd.Series(dtype=float)
+
+    hist_valid = hist.dropna(subset=["DT", "System", "Base event duration hours"]).copy()
+    if hist_valid.empty:
+        return avg_scheduled, pd.DataFrame()
+
+    months_by_truck = values.groupby("DT")["Period"].nunique().replace(0, np.nan)
+    profiles = (
+        hist_valid.groupby(["DT", "System"], dropna=False)
+        .agg(
+            historical_events=("Base event count", "sum"),
+            historical_down_hours=("Base event duration hours", "sum"),
+            mean_duration=("Base event duration hours", "mean"),
+            std_duration=("Base event duration hours", "std"),
+            kit_factor=("Kit improvement factor", "max"),
+        )
+        .reset_index()
+    )
+    profiles["months_observed"] = profiles["DT"].map(months_by_truck).fillna(values["Period"].nunique())
+    profiles["events_per_month"] = profiles["historical_events"] / profiles["months_observed"].replace(0, np.nan)
+    profiles["mean_duration"] = profiles["mean_duration"].fillna(0).clip(lower=0.01)
+    # Gamma needs a positive standard deviation. Use a conservative CV when only one event exists.
+    fallback_std = profiles["mean_duration"].clip(lower=0.01)
+    profiles["std_duration"] = profiles["std_duration"].fillna(fallback_std).clip(lower=0.01)
+    profiles["kit_factor"] = profiles["kit_factor"].fillna(0.0).clip(lower=0, upper=1)
+    profiles["events_per_month"] = profiles["events_per_month"].fillna(0.0).clip(lower=0)
+    return avg_scheduled, profiles
+
+
+@st.cache_data(show_spinner=False)
+def run_monte_carlo_forecast(
+    values_csv_key: str,
+    hist_csv_key: str,
+    kit_csv_key: str,
+    selected_trucks_tuple: tuple[int, ...],
+    selected_systems_tuple: tuple[str, ...],
+    apply_kit_impact: bool,
+    target_availability_2027: float,
+    annual_availability_decline: float,
+    annual_aging_factor: float,
+    simulations: int,
+    random_seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Hybrid forecast: historical bottom-up profiles + Monte Carlo uncertainty + Kit impact.
+
+    Cache keys are CSV strings to make Streamlit cache deterministic with embedded data.
+    """
+    values_all = pd.read_csv(StringIO(values_csv_key), parse_dates=["Period"])
+    hist_all = pd.read_csv(StringIO(hist_csv_key), parse_dates=["Period", "Event start", "Event end"])
+    kit_all = pd.read_csv(StringIO(kit_csv_key))
+
+    values_sel = values_all[values_all["DT"].isin(selected_trucks_tuple)].copy()
+    hist_sel = hist_all[
+        hist_all["DT"].isin(selected_trucks_tuple)
+        & hist_all["System"].isin(selected_systems_tuple)
+    ].copy()
+    values_adj, hist_adj = build_kit_adjusted_data(values_sel, hist_sel, kit_all, False)
+    avg_scheduled, profiles = build_forecast_profiles(values_adj, hist_adj)
+
+    forecast_months = pd.date_range("2027-01-01", "2030-12-01", freq="MS")
+    rng = np.random.default_rng(random_seed)
+    n = int(simulations)
+    selected_trucks = list(selected_trucks_tuple)
+
+    if profiles.empty or len(selected_trucks) == 0:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    fleet_month = {
+        period: {
+            "base_down": np.zeros(n),
+            "base_events": np.zeros(n),
+            "kit_down": np.zeros(n),
+            "kit_events": np.zeros(n),
+            "scheduled": 0.0,
+        }
+        for period in forecast_months
+    }
+    truck_year = {}
+    fleet_default_sched = float(avg_scheduled.mean()) if not avg_scheduled.empty and pd.notna(avg_scheduled.mean()) else 720.0
+
+    for dt in selected_trucks:
+        dt_sched = float(avg_scheduled.get(dt, fleet_default_sched))
+        for period in forecast_months:
+            fleet_month[period]["scheduled"] += dt_sched
+            truck_year.setdefault((dt, period.year), {
+                "base_down": np.zeros(n),
+                "base_events": np.zeros(n),
+                "kit_down": np.zeros(n),
+                "kit_events": np.zeros(n),
+                "scheduled": 0.0,
+            })
+            truck_year[(dt, period.year)]["scheduled"] += dt_sched
+
+    for _, row in profiles.iterrows():
+        dt = int(row["DT"])
+        if dt not in selected_trucks:
+            continue
+        lam0 = float(row["events_per_month"])
+        if lam0 <= 0:
+            continue
+        mean_dur = float(row["mean_duration"])
+        std_dur = float(row["std_duration"])
+        kit_factor = float(row["kit_factor"])
+        shape_single = (mean_dur / std_dur) ** 2 if std_dur > 0 else 1.0
+        scale_single = (std_dur ** 2) / mean_dur if mean_dur > 0 else 1.0
+        shape_single = max(shape_single, 0.05)
+        scale_single = max(scale_single, 0.01)
+
+        for period in forecast_months:
+            year_index = period.year - 2027
+            aging = max(0.0, 1 + annual_aging_factor * year_index)
+            lam = max(0.0, lam0 * aging)
+            events = rng.poisson(lam, size=n).astype(float)
+            total_duration = np.zeros(n)
+            positive = events > 0
+            if positive.any():
+                total_duration[positive] = rng.gamma(
+                    shape=shape_single * events[positive],
+                    scale=scale_single,
+                )
+            kit_multiplier = 1 - kit_factor
+            base_down = total_duration
+            base_events = events
+            kit_down = total_duration * kit_multiplier
+            kit_events = events * kit_multiplier
+
+            fm = fleet_month[period]
+            fm["base_down"] += base_down
+            fm["base_events"] += base_events
+            fm["kit_down"] += kit_down
+            fm["kit_events"] += kit_events
+            ty = truck_year[(dt, period.year)]
+            ty["base_down"] += base_down
+            ty["base_events"] += base_events
+            ty["kit_down"] += kit_down
+            ty["kit_events"] += kit_events
+
+    # Calibrate the active scenario to the intended yearly availability path.
+    calibration = {}
+    for year in range(2027, 2031):
+        sched_year = sum(v["scheduled"] for p, v in fleet_month.items() if p.year == year)
+        raw_down = sum(
+            (v["kit_down"] if apply_kit_impact else v["base_down"]).mean()
+            for p, v in fleet_month.items() if p.year == year
+        )
+        target_av = np.clip(target_availability_2027 - annual_availability_decline * (year - 2027), 0.50, 0.98)
+        target_down = sched_year * (1 - target_av)
+        calibration[year] = target_down / raw_down if raw_down > 0 else 1.0
+
+    monthly_rows = []
+    yearly_rows = []
+    for period, arrays in fleet_month.items():
+        cal = calibration[period.year]
+        scheduled = arrays["scheduled"]
+        base_down = arrays["base_down"] * cal
+        kit_down = arrays["kit_down"] * cal
+        base_events = arrays["base_events"] * cal
+        kit_events = arrays["kit_events"] * cal
+        base_operated = np.clip(scheduled - base_down, 0, None)
+        kit_operated = np.clip(scheduled - kit_down, 0, None)
+        base_av = np.clip(1 - base_down / scheduled, 0, 1) if scheduled > 0 else np.full(n, np.nan)
+        kit_av = np.clip(1 - kit_down / scheduled, 0, 1) if scheduled > 0 else np.full(n, np.nan)
+        base_mtbf = np.divide(base_operated, base_events, out=np.full(n, np.nan), where=base_events > 0)
+        kit_mtbf = np.divide(kit_operated, kit_events, out=np.full(n, np.nan), where=kit_events > 0)
+        active_av = kit_av if apply_kit_impact else base_av
+        active_mtbf = kit_mtbf if apply_kit_impact else base_mtbf
+        monthly_rows.append({
+            "Period": period,
+            "Year": period.year,
+            "YearMonth": period.strftime("%Y-%m"),
+            "Scheduled hours": scheduled,
+            "Base Availability mean": np.nanmean(base_av),
+            "Base Availability P10": np.nanpercentile(base_av, 10),
+            "Base Availability P50": np.nanpercentile(base_av, 50),
+            "Base Availability P90": np.nanpercentile(base_av, 90),
+            "Kit Availability mean": np.nanmean(kit_av),
+            "Kit Availability P10": np.nanpercentile(kit_av, 10),
+            "Kit Availability P50": np.nanpercentile(kit_av, 50),
+            "Kit Availability P90": np.nanpercentile(kit_av, 90),
+            "Active Availability mean": np.nanmean(active_av),
+            "Active Availability P10": np.nanpercentile(active_av, 10),
+            "Active Availability P50": np.nanpercentile(active_av, 50),
+            "Active Availability P90": np.nanpercentile(active_av, 90),
+            "Base MTBF mean": np.nanmean(base_mtbf),
+            "Kit MTBF mean": np.nanmean(kit_mtbf),
+            "Active MTBF mean": np.nanmean(active_mtbf),
+            "Base down hours mean": np.nanmean(base_down),
+            "Kit down hours mean": np.nanmean(kit_down),
+            "Base events mean": np.nanmean(base_events),
+            "Kit events mean": np.nanmean(kit_events),
+            "Calibration factor": cal,
+            "Target availability": np.clip(target_availability_2027 - annual_availability_decline * (period.year - 2027), 0.50, 0.98),
+        })
+
+    monthly_df = pd.DataFrame(monthly_rows)
+
+    for year, grp in monthly_df.groupby("Year"):
+        sched = grp["Scheduled hours"].sum()
+        base_down = grp["Base down hours mean"].sum()
+        kit_down = grp["Kit down hours mean"].sum()
+        base_events = grp["Base events mean"].sum()
+        kit_events = grp["Kit events mean"].sum()
+        yearly_rows.append({
+            "Year": year,
+            "Target availability": grp["Target availability"].iloc[0],
+            "Base Availability": 1 - base_down / sched if sched > 0 else np.nan,
+            "Kit Availability": 1 - kit_down / sched if sched > 0 else np.nan,
+            "Active Availability": (1 - kit_down / sched) if apply_kit_impact and sched > 0 else (1 - base_down / sched if sched > 0 else np.nan),
+            "Base MTBF": _safe_div(sched - base_down, base_events),
+            "Kit MTBF": _safe_div(sched - kit_down, kit_events),
+            "Active MTBF": _safe_div(sched - (kit_down if apply_kit_impact else base_down), kit_events if apply_kit_impact else base_events),
+            "Base down hours": base_down,
+            "Kit down hours": kit_down,
+            "Down hours avoided by kit": base_down - kit_down,
+            "Base events": base_events,
+            "Kit events": kit_events,
+            "Events avoided by kit": base_events - kit_events,
+            "Calibration factor": grp["Calibration factor"].mean(),
+        })
+    yearly_df = pd.DataFrame(yearly_rows)
+
+    truck_rows = []
+    for (dt, year), arrays in truck_year.items():
+        cal = calibration[year]
+        scheduled = arrays["scheduled"]
+        base_down = arrays["base_down"] * cal
+        kit_down = arrays["kit_down"] * cal
+        base_events = arrays["base_events"] * cal
+        kit_events = arrays["kit_events"] * cal
+        active_down = kit_down if apply_kit_impact else base_down
+        active_events = kit_events if apply_kit_impact else base_events
+        active_operated = np.clip(scheduled - active_down, 0, None)
+        active_av = np.clip(1 - active_down / scheduled, 0, 1) if scheduled > 0 else np.full(n, np.nan)
+        active_mtbf = np.divide(active_operated, active_events, out=np.full(n, np.nan), where=active_events > 0)
+        truck_rows.append({
+            "DT": dt,
+            "Year": year,
+            "Availability mean": np.nanmean(active_av),
+            "Availability P10": np.nanpercentile(active_av, 10),
+            "Availability P50": np.nanpercentile(active_av, 50),
+            "Availability P90": np.nanpercentile(active_av, 90),
+            "MTBF mean": np.nanmean(active_mtbf),
+            "Down hours mean": np.nanmean(active_down),
+            "Events mean": np.nanmean(active_events),
+            "Scheduled hours": scheduled,
+        })
+    truck_df = pd.DataFrame(truck_rows).sort_values(["Year", "Availability mean"])
+    return monthly_df, yearly_df, truck_df
+
+
 values_df = load_values_data()
 historical_df = load_historical_system_downs()
 kit_df = load_ponderate_kit_data()
@@ -312,6 +571,12 @@ with st.sidebar:
     system_options = sorted(historical_df["System"].dropna().unique().tolist())
     selected_systems = st.multiselect("Systems", system_options, default=system_options)
     kits_reactivation_improvement = st.toggle("Kit reactivation impact", value=False, help="Apply the Ponderate weight Kit factor to reduce down hours by system and simulate the availability improvement.")
+    with st.expander("Forecast 2027-2030 controls", expanded=False):
+        forecast_target_2027 = st.slider("Target availability 2027", 0.75, 0.95, 0.85, 0.005, format="%.3f")
+        forecast_annual_decline = st.slider("Annual availability reduction", 0.000, 0.030, 0.005, 0.001, format="%.3f")
+        forecast_aging_factor = st.slider("Annual aging factor on events/down", 0.000, 0.150, 0.040, 0.005, format="%.3f")
+        forecast_simulations = st.select_slider("Monte Carlo simulations", options=[500, 1000, 2000, 5000], value=1000)
+        forecast_seed = st.number_input("Random seed", min_value=1, max_value=999999, value=2027, step=1)
 
 start_sel = pd.Timestamp(selected_range[0]).replace(day=1)
 end_sel = pd.Timestamp(selected_range[1]) + pd.offsets.MonthEnd(0)
@@ -328,6 +593,23 @@ filtered_values, filtered_hist = build_kit_adjusted_data(
 fleet = fleet_monthly(filtered_values)
 trucks = truck_summary(filtered_values, mission_hours)
 
+values_cache_key = values_df.to_csv(index=False)
+historical_cache_key = historical_df.to_csv(index=False)
+kit_cache_key = kit_df.to_csv(index=False)
+forecast_monthly, forecast_yearly, forecast_truck = run_monte_carlo_forecast(
+    values_cache_key,
+    historical_cache_key,
+    kit_cache_key,
+    tuple(selected_trucks),
+    tuple(selected_systems),
+    kits_reactivation_improvement,
+    forecast_target_2027,
+    forecast_annual_decline,
+    forecast_aging_factor,
+    forecast_simulations,
+    int(forecast_seed),
+)
+
 base_fleet_availability = 1 - filtered_values["Base Hours down (EVs)"].sum() / filtered_values["hours scheduled"].sum()
 kit_fleet_availability = 1 - filtered_values["Kit adjusted Hours down (EVs)"].sum() / filtered_values["hours scheduled"].sum()
 active_fleet_availability = 1 - filtered_values["Hours down (EVs)"].sum() / filtered_values["hours scheduled"].sum()
@@ -340,7 +622,7 @@ k3.metric("System-down events", f"{len(filtered_hist):,}")
 k4.metric("Base system-down duration", f"{num(filtered_hist['Base event duration hours'].sum())} h")
 k5.metric("Kit down reduction", f"{num(kit_down_reduction)} h")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Fleet trend", "Truck ranking", "Down by system", "Embedded data quality"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Fleet trend", "Truck ranking", "Down by system", "Forecast 2027-2030", "Embedded data quality"])
 
 with tab1:
     st.subheader("Fleet availability and MTBF trend")
@@ -596,7 +878,156 @@ with tab3:
             st.dataframe(filtered_hist[detail_cols], use_container_width=True)
 
 
+
 with tab4:
+    st.subheader("Forecast 2027-2030: Hybrid bottom-up + Monte Carlo model")
+    st.caption(
+        "The forecast uses historical truck/system event intensity, simulated event counts and durations, "
+        "annual degradation, and the Kit reactivation impact factor. The active scenario is calibrated "
+        "to the selected availability target path so the fleet remains close to 85% while gradually declining year by year."
+    )
+    if forecast_monthly.empty:
+        st.warning("No forecast could be generated for the current truck/system selection.")
+    else:
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Forecast horizon", "Jan 2027-Dec 2030")
+        f2.metric("Simulations", f"{forecast_simulations:,}")
+        f3.metric("2027 target", pct(forecast_target_2027))
+        f4.metric("Annual reduction", pct(forecast_annual_decline))
+
+        st.markdown("**Fleet availability forecast**")
+        fig_f_av = go.Figure()
+        fig_f_av.add_trace(go.Scatter(
+            x=forecast_monthly["Period"],
+            y=forecast_monthly["Base Availability mean"],
+            mode="lines",
+            name="Base forecast",
+            hovertemplate="%{x|%Y-%m}<br>Base availability=%{y:.1%}<extra></extra>",
+        ))
+        fig_f_av.add_trace(go.Scatter(
+            x=forecast_monthly["Period"],
+            y=forecast_monthly["Base Availability P90"],
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+        fig_f_av.add_trace(go.Scatter(
+            x=forecast_monthly["Period"],
+            y=forecast_monthly["Base Availability P10"],
+            mode="lines",
+            fill="tonexty",
+            line=dict(width=0),
+            name="Base P10-P90 band",
+            hoverinfo="skip",
+            opacity=0.25,
+        ))
+        if kits_reactivation_improvement:
+            fig_f_av.add_trace(go.Scatter(
+                x=forecast_monthly["Period"],
+                y=forecast_monthly["Kit Availability mean"],
+                mode="lines+markers",
+                name="Kit reactivation impact",
+                line=dict(color="green", dash="dot"),
+                hovertemplate="%{x|%Y-%m}<br>Kit availability=%{y:.1%}<extra></extra>",
+            ))
+        fig_f_av.add_trace(go.Scatter(
+            x=forecast_monthly["Period"],
+            y=forecast_monthly["Target availability"],
+            mode="lines",
+            name="Target path",
+            line=dict(dash="dash"),
+            hovertemplate="%{x|%Y-%m}<br>Target=%{y:.1%}<extra></extra>",
+        ))
+        fig_f_av.update_layout(title="Monthly fleet availability forecast with uncertainty band", yaxis_tickformat=".0%", yaxis_title="Availability")
+        st.plotly_chart(fig_f_av, use_container_width=True)
+
+        st.markdown("**Fleet MTBF forecast**")
+        fig_f_mtbf = go.Figure()
+        fig_f_mtbf.add_trace(go.Scatter(
+            x=forecast_monthly["Period"],
+            y=forecast_monthly["Base MTBF mean"],
+            mode="lines+markers",
+            name="Base MTBF forecast",
+            hovertemplate="%{x|%Y-%m}<br>Base MTBF=%{y:,.1f} h<extra></extra>",
+        ))
+        if kits_reactivation_improvement:
+            fig_f_mtbf.add_trace(go.Scatter(
+                x=forecast_monthly["Period"],
+                y=forecast_monthly["Kit MTBF mean"],
+                mode="lines+markers",
+                name="Kit reactivation impact",
+                line=dict(color="green", dash="dot"),
+                hovertemplate="%{x|%Y-%m}<br>Kit MTBF=%{y:,.1f} h<extra></extra>",
+            ))
+        fig_f_mtbf.update_layout(title="Monthly fleet MTBF forecast", yaxis_title="MTBF [hours/event]")
+        st.plotly_chart(fig_f_mtbf, use_container_width=True)
+
+        st.markdown("**Yearly forecast summary**")
+        st.dataframe(
+            forecast_yearly.style.format({
+                "Target availability": "{:.1%}",
+                "Base Availability": "{:.1%}",
+                "Kit Availability": "{:.1%}",
+                "Active Availability": "{:.1%}",
+                "Base MTBF": "{:,.1f}",
+                "Kit MTBF": "{:,.1f}",
+                "Active MTBF": "{:,.1f}",
+                "Base down hours": "{:,.1f}",
+                "Kit down hours": "{:,.1f}",
+                "Down hours avoided by kit": "{:,.1f}",
+                "Base events": "{:,.1f}",
+                "Kit events": "{:,.1f}",
+                "Events avoided by kit": "{:,.1f}",
+                "Calibration factor": "{:.3f}",
+            }),
+            use_container_width=True,
+        )
+
+        st.markdown("**Truck risk ranking by forecast availability**")
+        selected_forecast_year = st.selectbox("Forecast year for truck ranking", [2027, 2028, 2029, 2030], index=3)
+        truck_year_view = forecast_truck[forecast_truck["Year"] == selected_forecast_year].copy()
+        fig_truck_forecast = px.bar(
+            truck_year_view.sort_values("Availability mean"),
+            x="DT",
+            y="Availability mean",
+            text="Availability mean",
+            hover_data=["Availability P10", "Availability P50", "Availability P90", "MTBF mean", "Down hours mean", "Events mean"],
+            title=f"Truck forecast availability ranking - {selected_forecast_year}",
+        )
+        fig_truck_forecast.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+        fig_truck_forecast.update_yaxes(tickformat=".0%")
+        fig_truck_forecast.update_xaxes(type="category")
+        st.plotly_chart(fig_truck_forecast, use_container_width=True)
+        st.dataframe(
+            truck_year_view.style.format({
+                "Availability mean": "{:.1%}",
+                "Availability P10": "{:.1%}",
+                "Availability P50": "{:.1%}",
+                "Availability P90": "{:.1%}",
+                "MTBF mean": "{:,.1f}",
+                "Down hours mean": "{:,.1f}",
+                "Events mean": "{:,.1f}",
+                "Scheduled hours": "{:,.1f}",
+            }),
+            use_container_width=True,
+        )
+
+        with st.expander("Model calculation notes"):
+            st.markdown(
+                """
+                **Events** are simulated with a Poisson distribution using the historical monthly event rate by truck and system.
+
+                **Event duration** is simulated with a Gamma distribution fitted from the historical mean and standard deviation of each truck/system duration.
+
+                **Kit reactivation impact** reduces both simulated events and simulated down hours by the Ponderate weight Kit factor for each system.
+
+                **Annual degradation** increases the expected event intensity year by year. The final active scenario is calibrated to the selected availability path, starting at the 2027 target and reducing by the selected annual availability reduction.
+                """
+            )
+
+
+with tab5:
     st.subheader("Embedded data quality")
     expected_trucks = set(range(MIN_TRUCK, MAX_TRUCK + 1))
     values_trucks = set(int(x) for x in values_df["DT"].dropna().unique())
