@@ -14,6 +14,7 @@ from io import StringIO
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(page_title="Truck Availability & Reliability Analysis", page_icon="🚛", layout="wide")
@@ -129,9 +130,16 @@ def build_kit_adjusted_data(values_df: pd.DataFrame, historical_df: pd.DataFrame
     hist = historical_df.merge(kit_df, on="System", how="left")
     hist["Kit improvement factor"] = hist["Kit improvement factor"].fillna(0.0)
     hist["Ponderate weight Kit"] = hist["Ponderate weight Kit"].fillna("0%")
+
+    # Base values from each Historical event.
     hist["Base event duration hours"] = hist["Event duration hours"]
+    hist["Base event count"] = 1.0
+
+    # The Ponderate weight Kit reduces both down hours and event count in the same proportion.
     hist["Kit adjusted event duration hours"] = hist["Base event duration hours"] * (1 - hist["Kit improvement factor"])
     hist["Kit reduced down hours"] = hist["Base event duration hours"] - hist["Kit adjusted event duration hours"]
+    hist["Kit adjusted event count"] = hist["Base event count"] * (1 - hist["Kit improvement factor"])
+    hist["Kit reduced event count"] = hist["Base event count"] - hist["Kit adjusted event count"]
 
     monthly_reduction = (
         hist.groupby(["DT", "Period"], dropna=False)
@@ -139,19 +147,29 @@ def build_kit_adjusted_data(values_df: pd.DataFrame, historical_df: pd.DataFrame
             Historical_base_down_hours=("Base event duration hours", "sum"),
             Historical_adjusted_down_hours=("Kit adjusted event duration hours", "sum"),
             Kit_reduced_down_hours=("Kit reduced down hours", "sum"),
+            Historical_base_events=("Base event count", "sum"),
+            Historical_adjusted_events=("Kit adjusted event count", "sum"),
+            Kit_reduced_events=("Kit reduced event count", "sum"),
         )
         .reset_index()
     )
 
     values = values_df.merge(monthly_reduction, on=["DT", "Period"], how="left")
-    for col in ["Historical_base_down_hours", "Historical_adjusted_down_hours", "Kit_reduced_down_hours"]:
+    for col in [
+        "Historical_base_down_hours", "Historical_adjusted_down_hours", "Kit_reduced_down_hours",
+        "Historical_base_events", "Historical_adjusted_events", "Kit_reduced_events",
+    ]:
         values[col] = values[col].fillna(0.0)
 
     values["Base Hours down (EVs)"] = values["Hours down (EVs)"]
     values["Kit adjusted Hours down (EVs)"] = (values["Base Hours down (EVs)"] - values["Kit_reduced_down_hours"]).clip(lower=0)
 
+    values["Base Events MTBF"] = values["Number of events (According MTBF)"]
+    values["Kit adjusted Events MTBF"] = (values["Base Events MTBF"] - values["Kit_reduced_events"]).clip(lower=0)
+
     if apply_improvement:
         values["Hours down (EVs)"] = values["Kit adjusted Hours down (EVs)"]
+        values["Number of events (According MTBF)"] = values["Kit adjusted Events MTBF"]
 
     values["Base Availability"] = np.where(
         values["hours scheduled"] > 0,
@@ -165,6 +183,10 @@ def build_kit_adjusted_data(values_df: pd.DataFrame, historical_df: pd.DataFrame
     )
     values["Availability improvement points"] = values["Kit adjusted Availability"] - values["Base Availability"]
 
+    values["Base MTBF"] = np.where(values["Base Events MTBF"] > 0, values["hours operated"] / values["Base Events MTBF"], np.nan)
+    values["Kit adjusted MTBF"] = np.where(values["Kit adjusted Events MTBF"] > 0, values["hours operated"] / values["Kit adjusted Events MTBF"], np.nan)
+    values["MTBF improvement hours"] = values["Kit adjusted MTBF"] - values["Base MTBF"]
+
     return values, hist
 
 
@@ -175,9 +197,37 @@ def fleet_monthly(values: pd.DataFrame) -> pd.DataFrame:
         operated = grp["hours operated"].sum(min_count=1)
         down = grp["Hours down (EVs)"].sum(min_count=1)
         events = grp["Number of events (According MTBF)"].sum(min_count=1)
+        base_down = grp["Base Hours down (EVs)"].sum(min_count=1) if "Base Hours down (EVs)" in grp.columns else down
+        kit_down = grp["Kit adjusted Hours down (EVs)"].sum(min_count=1) if "Kit adjusted Hours down (EVs)" in grp.columns else down
+        base_events = grp["Base Events MTBF"].sum(min_count=1) if "Base Events MTBF" in grp.columns else events
+        kit_events = grp["Kit adjusted Events MTBF"].sum(min_count=1) if "Kit adjusted Events MTBF" in grp.columns else events
+
         mtbf = operated / events if pd.notna(events) and events > 0 else np.nan
         availability = 1 - down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
-        rows.append({"Period": period, "YearMonth": pd.Period(period, freq="M").strftime("%Y-%m"), "Availability": availability, "MTBF": mtbf, "Hours scheduled": scheduled, "Hours operated": operated, "Hours down": down, "Events MTBF": events, "Active trucks": grp["DT"].nunique()})
+        base_availability = 1 - base_down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
+        kit_availability = 1 - kit_down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
+        base_mtbf = operated / base_events if pd.notna(base_events) and base_events > 0 else np.nan
+        kit_mtbf = operated / kit_events if pd.notna(kit_events) and kit_events > 0 else np.nan
+
+        rows.append({
+            "Period": period,
+            "YearMonth": pd.Period(period, freq="M").strftime("%Y-%m"),
+            "Availability": availability,
+            "MTBF": mtbf,
+            "Base Availability": base_availability,
+            "Kit adjusted Availability": kit_availability,
+            "Base MTBF": base_mtbf,
+            "Kit adjusted MTBF": kit_mtbf,
+            "Hours scheduled": scheduled,
+            "Hours operated": operated,
+            "Hours down": down,
+            "Base hours down": base_down,
+            "Kit adjusted hours down": kit_down,
+            "Events MTBF": events,
+            "Base Events MTBF": base_events,
+            "Kit adjusted Events MTBF": kit_events,
+            "Active trucks": grp["DT"].nunique(),
+        })
     return pd.DataFrame(rows).sort_values("Period")
 
 
@@ -190,34 +240,54 @@ def truck_summary(values: pd.DataFrame, mission_hours: float) -> pd.DataFrame:
         base_down = grp["Base Hours down (EVs)"].sum(min_count=1) if "Base Hours down (EVs)" in grp.columns else down
         kit_down = grp["Kit adjusted Hours down (EVs)"].sum(min_count=1) if "Kit adjusted Hours down (EVs)" in grp.columns else down
         kit_reduction = grp["Kit_reduced_down_hours"].sum(min_count=1) if "Kit_reduced_down_hours" in grp.columns else 0.0
+
         events = grp["Number of events (According MTBF)"].sum(min_count=1)
+        base_events = grp["Base Events MTBF"].sum(min_count=1) if "Base Events MTBF" in grp.columns else events
+        kit_events = grp["Kit adjusted Events MTBF"].sum(min_count=1) if "Kit adjusted Events MTBF" in grp.columns else events
+        kit_event_reduction = grp["Kit_reduced_events"].sum(min_count=1) if "Kit_reduced_events" in grp.columns else 0.0
+
         mtbf = operated / events if pd.notna(events) and events > 0 else np.nan
+        base_mtbf = operated / base_events if pd.notna(base_events) and base_events > 0 else np.nan
+        kit_adjusted_mtbf = operated / kit_events if pd.notna(kit_events) and kit_events > 0 else np.nan
         availability = 1 - down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
         base_availability = 1 - base_down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
         kit_adjusted_availability = 1 - kit_down / scheduled if pd.notna(scheduled) and scheduled > 0 else np.nan
         improvement_points = kit_adjusted_availability - base_availability if pd.notna(base_availability) and pd.notna(kit_adjusted_availability) else np.nan
         reliability = np.exp(-mission_hours / mtbf) if pd.notna(mtbf) and mtbf > 0 else np.nan
+        base_reliability = np.exp(-mission_hours / base_mtbf) if pd.notna(base_mtbf) and base_mtbf > 0 else np.nan
+        kit_adjusted_reliability = np.exp(-mission_hours / kit_adjusted_mtbf) if pd.notna(kit_adjusted_mtbf) and kit_adjusted_mtbf > 0 else np.nan
+
         rows.append({
             "DT": int(dt),
             "Availability": availability,
             "Reliability": reliability,
             "MTBF": mtbf,
+            "Base MTBF": base_mtbf,
+            "Kit adjusted MTBF": kit_adjusted_mtbf,
+            "MTBF improvement hours": kit_adjusted_mtbf - base_mtbf if pd.notna(base_mtbf) and pd.notna(kit_adjusted_mtbf) else np.nan,
             "Hours down": down,
             "Base hours down": base_down,
             "Kit adjusted hours down": kit_down,
             "Kit reduced down hours": kit_reduction,
             "Events MTBF": events,
+            "Base Events MTBF": base_events,
+            "Kit adjusted Events MTBF": kit_events,
+            "Kit reduced events": kit_event_reduction,
             "Hours scheduled": scheduled,
             "Base Availability": base_availability,
             "Kit adjusted Availability": kit_adjusted_availability,
             "Availability improvement points": improvement_points,
+            "Base Reliability": base_reliability,
+            "Kit adjusted Reliability": kit_adjusted_reliability,
         })
     summary = pd.DataFrame(rows)
     if summary.empty:
         return pd.DataFrame(columns=[
-            "DT", "Availability", "Reliability", "MTBF", "Hours down", "Base hours down",
-            "Kit adjusted hours down", "Kit reduced down hours", "Events MTBF", "Hours scheduled",
-            "Base Availability", "Kit adjusted Availability", "Availability improvement points"
+            "DT", "Availability", "Reliability", "MTBF", "Base MTBF", "Kit adjusted MTBF",
+            "MTBF improvement hours", "Hours down", "Base hours down", "Kit adjusted hours down",
+            "Kit reduced down hours", "Events MTBF", "Base Events MTBF", "Kit adjusted Events MTBF",
+            "Kit reduced events", "Hours scheduled", "Base Availability", "Kit adjusted Availability",
+            "Availability improvement points", "Base Reliability", "Kit adjusted Reliability"
         ])
     return summary.sort_values("Availability", ascending=False)
 
@@ -241,7 +311,7 @@ with st.sidebar:
     top_n_systems = st.slider("Top systems to show", 5, 25, 10, 1)
     system_options = sorted(historical_df["System"].dropna().unique().tolist())
     selected_systems = st.multiselect("Systems", system_options, default=system_options)
-    kits_reactivation_improvement = st.toggle("Kits Reactivation improment", value=False, help="Apply the Ponderate weight Kit factor to reduce down hours by system and simulate the availability improvement.")
+    kits_reactivation_improvement = st.toggle("Kit reactivation impact", value=False, help="Apply the Ponderate weight Kit factor to reduce down hours by system and simulate the availability improvement.")
 
 start_sel = pd.Timestamp(selected_range[0]).replace(day=1)
 end_sel = pd.Timestamp(selected_range[1]) + pd.offsets.MonthEnd(0)
@@ -274,11 +344,75 @@ tab1, tab2, tab3, tab4 = st.tabs(["Fleet trend", "Truck ranking", "Down by syste
 
 with tab1:
     st.subheader("Fleet availability and MTBF trend")
-    fig_av = px.line(fleet, x="Period", y="Availability", markers=True, hover_data=["YearMonth", "Hours down", "Events MTBF", "Active trucks"])
+
+    fig_av = px.line(
+        fleet,
+        x="Period",
+        y="Base Availability",
+        markers=True,
+        hover_data=["YearMonth", "Base hours down", "Base Events MTBF", "Active trucks"],
+        title="Fleet availability: base vs Kit reactivation impact",
+        labels={"Base Availability": "Base availability"},
+    )
+    fig_av.update_traces(name="Base availability", showlegend=True)
+    if kits_reactivation_improvement:
+        fig_av.add_trace(
+            go.Scatter(
+                x=fleet["Period"],
+                y=fleet["Kit adjusted Availability"],
+                mode="lines+markers",
+                name="Kit reactivation impact",
+                line=dict(color="green", dash="dot"),
+                customdata=np.stack([
+                    fleet["YearMonth"],
+                    fleet["Kit adjusted hours down"],
+                    fleet["Kit adjusted Events MTBF"],
+                    fleet["Active trucks"],
+                ], axis=-1),
+                hovertemplate=(
+                    "Period=%{customdata[0]}<br>"
+                    "Kit adjusted availability=%{y:.1%}<br>"
+                    "Kit adjusted hours down=%{customdata[1]:,.1f}<br>"
+                    "Kit adjusted events=%{customdata[2]:,.1f}<br>"
+                    "Active trucks=%{customdata[3]}<extra></extra>"
+                ),
+            )
+        )
     fig_av.add_hline(y=availability_target, line_dash="dash", annotation_text="Availability target")
     fig_av.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig_av, use_container_width=True)
-    fig_mtbf = px.line(fleet, x="Period", y="MTBF", markers=True, hover_data=["YearMonth", "Events MTBF", "Hours operated"])
+
+    fig_mtbf = px.line(
+        fleet,
+        x="Period",
+        y="Base MTBF",
+        markers=True,
+        hover_data=["YearMonth", "Base Events MTBF", "Hours operated"],
+        title="Fleet MTBF: base vs Kit reactivation impact",
+        labels={"Base MTBF": "Base MTBF"},
+    )
+    fig_mtbf.update_traces(name="Base MTBF", showlegend=True)
+    if kits_reactivation_improvement:
+        fig_mtbf.add_trace(
+            go.Scatter(
+                x=fleet["Period"],
+                y=fleet["Kit adjusted MTBF"],
+                mode="lines+markers",
+                name="Kit reactivation impact",
+                line=dict(color="green", dash="dot"),
+                customdata=np.stack([
+                    fleet["YearMonth"],
+                    fleet["Kit adjusted Events MTBF"],
+                    fleet["Hours operated"],
+                ], axis=-1),
+                hovertemplate=(
+                    "Period=%{customdata[0]}<br>"
+                    "Kit adjusted MTBF=%{y:,.1f} h<br>"
+                    "Kit adjusted events=%{customdata[1]:,.1f}<br>"
+                    "Hours operated=%{customdata[2]:,.1f}<extra></extra>"
+                ),
+            )
+        )
     st.plotly_chart(fig_mtbf, use_container_width=True)
 
 with tab2:
@@ -306,7 +440,7 @@ with tab2:
 
 with tab3:
     st.subheader("Analysis of down by system")
-    st.caption("This section is built from Historical and applies the Ponderate weight Kit by system when the sidebar option **Kits Reactivation improment** is enabled.")
+    st.caption("This section is built from Historical and applies the Ponderate weight Kit by system when the sidebar option **Kit reactivation impact** is enabled.")
     if filtered_hist.empty:
         st.warning("No historical system-down records for the selected filters.")
     else:
@@ -317,6 +451,9 @@ with tab3:
                 Duration_hours=("Base event duration hours", "sum"),
                 Kit_adjusted_duration_hours=("Kit adjusted event duration hours", "sum"),
                 Kit_reduced_down_hours=("Kit reduced down hours", "sum"),
+                Base_events=("Base event count", "sum"),
+                Kit_adjusted_events=("Kit adjusted event count", "sum"),
+                Kit_reduced_events=("Kit reduced event count", "sum"),
                 Kit_improvement_factor=("Kit improvement factor", "max"),
                 Avg_duration=("Base event duration hours", "mean"),
                 Trucks_affected=("DT", "nunique"),
@@ -331,6 +468,7 @@ with tab3:
         system_summary["Duration share"] = np.where(total_duration > 0, system_summary["Duration_hours"] / total_duration, np.nan)
         system_summary["Pareto cumulative"] = system_summary["Duration share"].cumsum()
         system_summary["Reduction share"] = np.where(system_summary["Duration_hours"] > 0, system_summary["Kit_reduced_down_hours"] / system_summary["Duration_hours"], 0)
+        system_summary["Event reduction share"] = np.where(system_summary["Base_events"] > 0, system_summary["Kit_reduced_events"] / system_summary["Base_events"], 0)
         top_systems = system_summary.head(top_n_systems)
 
         c1, c2, c3, c4 = st.columns(4)
@@ -357,6 +495,8 @@ with tab3:
                 Kit_adjusted_duration_hours=("Kit adjusted event duration hours", "sum"),
                 Kit_reduced_down_hours=("Kit reduced down hours", "sum"),
                 Events=("System", "size"),
+                Kit_adjusted_events=("Kit adjusted event count", "sum"),
+                Kit_reduced_events=("Kit reduced event count", "sum"),
             )
             .reset_index()
         )
@@ -386,15 +526,22 @@ with tab3:
                 Base_hours_down=("Base Hours down (EVs)", "sum"),
                 Kit_adjusted_hours_down=("Kit adjusted Hours down (EVs)", "sum"),
                 Kit_reduced_down_hours=("Kit_reduced_down_hours", "sum"),
+                Base_events_MTBF=("Base Events MTBF", "sum"),
+                Kit_adjusted_events_MTBF=("Kit adjusted Events MTBF", "sum"),
+                Kit_reduced_events=("Kit_reduced_events", "sum"),
                 Scheduled_hours=("hours scheduled", "sum"),
+                Operated_hours=("hours operated", "sum"),
                 Base_availability=("Base Availability", "mean"),
                 Kit_adjusted_availability=("Kit adjusted Availability", "mean"),
             )
             .reset_index()
         )
         truck_impact["Availability improvement points"] = truck_impact["Kit_adjusted_availability"] - truck_impact["Base_availability"]
+        truck_impact["Base_MTBF"] = np.where(truck_impact["Base_events_MTBF"] > 0, truck_impact["Operated_hours"] / truck_impact["Base_events_MTBF"], np.nan)
+        truck_impact["Kit_adjusted_MTBF"] = np.where(truck_impact["Kit_adjusted_events_MTBF"] > 0, truck_impact["Operated_hours"] / truck_impact["Kit_adjusted_events_MTBF"], np.nan)
+        truck_impact["MTBF improvement hours"] = truck_impact["Kit_adjusted_MTBF"] - truck_impact["Base_MTBF"]
 
-        st.markdown("**Truck availability impact from Kits Reactivation improment**")
+        st.markdown("**Truck availability impact from Kit reactivation impact**")
         fig_truck_impact = px.bar(
             truck_impact.sort_values("Availability improvement points", ascending=False),
             x="DT",
@@ -443,7 +590,8 @@ with tab3:
         with st.expander("Embedded Historical event detail"):
             detail_cols = [
                 "DT", "System", "Event start", "Event end", "Base event duration hours",
-                "Ponderate weight Kit", "Kit adjusted event duration hours", "Kit reduced down hours"
+                "Ponderate weight Kit", "Kit adjusted event duration hours", "Kit reduced down hours",
+                "Kit adjusted event count", "Kit reduced event count"
             ]
             st.dataframe(filtered_hist[detail_cols], use_container_width=True)
 
